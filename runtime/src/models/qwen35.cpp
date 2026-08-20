@@ -402,8 +402,11 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         p_->lin_k=p_->alloc<bf16>(p_->linear_qdim);
         p_->lin_v=p_->alloc<bf16>(p_->linear_vdim);
         p_->lin_z=p_->alloc<bf16>(p_->linear_vdim);
-        p_->lin_alpha=p_->alloc<bf16>(cfg.linear_v_heads);
-        p_->lin_beta=p_->alloc<bf16>(cfg.linear_v_heads);
+        // ONE allocation, two views: beta sits immediately after alpha, so a single
+        // [2*v_heads, H] GEMV writes both halves in place and every consumer below keeps using
+        // s.lin_alpha / s.lin_beta unchanged.
+        p_->lin_alpha=p_->alloc<bf16>(2 * cfg.linear_v_heads);
+        p_->lin_beta=p_->lin_alpha + cfg.linear_v_heads;
         p_->lin_gdn=p_->alloc<bf16>(p_->linear_vdim);
         p_->lin_norm=p_->alloc<bf16>(p_->linear_vdim);
         p_->lin_conv_state=p_->alloc<bf16>((size_t)cfg.n_layers * (cfg.linear_conv_kernel - 1) * p_->linear_qkvdim);
@@ -619,7 +622,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->qraw); cudaFree(p_->qgate);
     cudaFree(p_->dbg_xn_dump);
     cudaFree(p_->lin_qkv); cudaFree(p_->lin_q); cudaFree(p_->lin_k); cudaFree(p_->lin_v);
-    cudaFree(p_->lin_z); cudaFree(p_->lin_alpha); cudaFree(p_->lin_beta);
+    cudaFree(p_->lin_z); cudaFree(p_->lin_alpha);   // lin_beta is a view into lin_alpha, not an allocation
     cudaFree(p_->lin_gdn); cudaFree(p_->lin_norm); cudaFree(p_->lin_conv_state); cudaFree(p_->lin_state);
     cudaFree(p_->shared_gate_tmp);
     cudaFree(p_->nvfp4_g); cudaFree(p_->nvfp4_u); cudaFree(p_->nvfp4_h);
@@ -1184,6 +1187,27 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             }
         };
 
+        // alpha and beta in ONE launch when the checkpoint let us concatenate them.
+        //
+        // These are the smallest Linears in the model -- [v_heads, H] with v_heads 32 or 48 -- so
+        // each one is ~330 KB of weights and its runtime is launch latency, not bandwidth:
+        // measured 5.19 us apiece against a ~0.2 us bandwidth floor, 96 of them per decode step
+        // (48 GDN layers x 2) for 0.533 ms. Concatenated they are one [2*v_heads, H] GEMV whose
+        // rows are the same rows in the same order, so lin_alpha/lin_beta come out bit-identical
+        // -- the kernel computes each output row as an independent dot product, and beta is simply
+        // rows v_heads..2*v_heads-1 of the same launch (which is why lin_beta is allocated as a
+        // view into lin_alpha above).
+        // SPARKINFER_GDN_AB_FUSE=0 restores the two separate projections.
+        static const bool gdn_ab_fuse = []{ const char* e = getenv("SPARKINFER_GDN_AB_FUSE");
+                                            return !(e && e[0] == '0'); }();
+        auto proj_ab = [&](cudaStream_t pst) {
+            if (gdn_ab_fuse && w.ssm_ab) {
+                proj_xn(w.ssm_ab, 0, s.lin_alpha, 2 * c.linear_v_heads, pst);
+            } else {
+                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, pst);
+                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, pst);
+            }
+        };
         if (w.linear_attn) {
             const bool any_q4k = (w.wqkv_type == 12 || w.wqkv_gate_type == 12 ||
                                   w.ssm_alpha_type == 12 || w.ssm_beta_type == 12);
@@ -1211,8 +1235,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             } else if (gdn_fused_proj && gdn_pipelined) {
                 cudaEventRecord(s.ev_pipe_fork, st);
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
+                proj_ab(s.stream_v);
                 cudaEventRecord(s.ev_gdn_ab, s.stream_v);
                 kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
                                                        s.lin_qkv, s.lin_z,
@@ -1223,21 +1246,18 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                 cudaStreamWaitEvent(s.stream_v, s.ev_pipe_fork, 0);
                 proj_xn(w.wqkv_gate, w.wqkv_gate_type, s.lin_z, s.linear_vdim, s.stream_k);
                 cudaEventRecord(s.ev_gdn_z, s.stream_k);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, s.stream_v);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, s.stream_v);
+                proj_ab(s.stream_v);
                 cudaEventRecord(s.ev_gdn_ab, s.stream_v);
                 proj_xn(w.wqkv, w.wqkv_type, s.lin_qkv, s.linear_qkvdim, st);
             } else if (gdn_fused_proj) {
                 kernels::launch_mmvq_gdn_qkv_z_pack2(s.aq81, w.wqkv, w.wqkv_gate,
                                                        s.lin_qkv, s.lin_z,
                                                        s.linear_qkvdim, s.linear_vdim, H, st);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, st);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, st);
+                proj_ab(st);
             } else {
                 proj_xn(w.wqkv, w.wqkv_type, s.lin_qkv, s.linear_qkvdim, st);
                 proj_xn(w.wqkv_gate, w.wqkv_gate_type, s.lin_z, s.linear_vdim, st);
-                proj_xn(w.ssm_alpha, w.ssm_alpha_type, s.lin_alpha, c.linear_v_heads, st);
-                proj_xn(w.ssm_beta, w.ssm_beta_type, s.lin_beta, c.linear_v_heads, st);
+                proj_ab(st);
             }
 
             bf16* conv_state = s.lin_conv_state +
@@ -3150,9 +3170,44 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // than per step, because the verify graph dflash_warm_verify captures is sized from this and
     // a graph built for a row count the stream never uses costs more than the rows it saves --
     // measured, per-step narrowing under a 4-row warm graph recovers only 0.7% of the 9.4%.
+    // TWO proposals in the narrow band, not one -- the measurement that chose one is stale.
+    //
+    // #878 narrowed this band to depth 1 on a grid showing "mean accepted length is identical at
+    // depth 1, 2 and 3 at 4k". That was true when it was taken and it is not a property of the
+    // draft: BOTH causes have since been fixed. #893 found the Markov head was reading base-logit
+    // row r for proposal r when the chain produces proposal r from row r-1, so "every position is
+    // displaced" -- its words -- which is precisely a defect that flattens the DEEPER positions
+    // while leaving position 1 (whose conditioning was right either way) alone. #894 then restored
+    // the bidirectional block mask, whose entire purpose is to give the later mask rows the
+    // context they were trained with. Depth was pinned by a grid run through both defects.
+    //
+    // The draft ALREADY pays for four rows. #894 forces the block width to 4 even at depth 1
+    // (markov_w1 && block_size == 7), because the later mask rows are trained context for the row
+    // that produces proposal 1 -- so rows 2 and 3 are computed on every step today and thrown
+    // away. Measured on RTX 5090 at ctx=4096, the draft barely notices being asked for them:
+    // 2.212 ms at depth 1, 2.450 at depth 2, 2.468 at depth 3. What the extra proposal costs is
+    // one more verify row.
+    //
+    // Cost ladder, this box, batched verify armed (the path the scored context runs):
+    //
+    //     depth  verify rows   batched      draft     step
+    //       1         2        12.518 ms   2.212 ms   14.730 ms
+    //       2         3        14.567 ms   2.450 ms   17.017 ms
+    //       3         4        16.992 ms   2.468 ms   19.460 ms
+    //
+    // 14.730 ms reproduces the 14.79 ms implied by the eval box's own 112.34 tok/s at tau 1.662,
+    // so this ladder is the one that decides the trade there. Against that baseline depth 2 breaks
+    // even at tau 1.912 and depth 3 at 2.186 -- in acceptance terms, position 2 has to land 37.7%
+    // of the time for depth 2 to pay, against the 66.2% position 1 already lands. Depth 2 is
+    // chosen over depth 3 purely on that break-even: both reach the same throughput at similar
+    // per-position acceptance, but depth 2 needs far less of it to avoid losing.
+    //
+    // Scope is the narrow band only. Below kNarrowMinSeq keeps 3 and the >= kDeepMinSeq branch
+    // keeps 7, both untouched. SPARKINFER_DFLASH_PROPOSALS pins any depth explicitly, so the whole
+    // ladder is one env apart in a single binary.
     const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
                              : ((n + max_new) >= kDeepMinSeq ? 7
-                                : (n >= kNarrowMinSeq ? 1 : 3));
+                                : (n >= kNarrowMinSeq ? 2 : 3));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN
@@ -3172,7 +3227,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // hard bound that kept the batched verify away from long context entirely (the #712 gap); it
     // is now the boundary between "main's behaviour, unchanged" and "the new exact long-context
     // path", so nothing already validated at short context moves.
-    // Compared against keep_ema8 in the SCALED domain (kEngageKeep * 8), not by shifting the EMA
+    // Compared against the EMA in the SCALED domain (kEngageKeep * 8), not by shifting the EMA
     // down first. Shifting floors it, which collapses the very gap the gate exists to resolve:
     // 512-ctx sits at tau 2.19 (ema8 ~17.5) and 4k at tau 3.91 (ema8 ~31.3), and both floor to the
     // same value. Scaled, the threshold lands cleanly between them at 24.
@@ -3197,7 +3252,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 2;
         return v < 1 ? 1 : v;
     }();
-    // The engage threshold in EIGHTHS, which is the domain keep_ema8 already lives in, so it can
+    // The engage threshold in EIGHTHS, the domain the caller reasons about, so it can
     // express the number the trade actually turns on instead of rounding it to a whole token.
     //
     // One batched pass replaces `keep` sequential target forwards, so it pays exactly when
@@ -3209,10 +3264,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     //
     // 10/8 = 1.25, just above the measured 1.23, so the gate keeps a margin against the ratio
     // rather than sitting on it. It is self-limiting at short context, which is why this is not
-    // simply "always batch": at ctx=512 acceptance is 1.0, keep_ema8 settles at 8, and 8 < 10
-    // leaves the stream on the token loop exactly as today -- which matters, because the batched
-    // pass is measured 31% SLOWER there. SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS=16 restores main's
-    // whole-token threshold, so both arms of an A/B come out of one binary.
+    // simply "always batch": at ctx=512 acceptance is 1.0, the EMA settles at 1.0 tokens, which is
+    // below 1.25 and leaves the stream on the token loop -- which matters, because the batched
+    // pass is measured 31% SLOWER there. Since the EMA is held x64 it now settles there at ctx=4k
+    // too, where main's x8 form was pinned on the threshold by its own seed.
+    // SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS=16 restores main's whole-token threshold, so both arms
+    // of an A/B come out of one binary.
     static const int kEngageKeepEighths = []{
         const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS");
         int v = e ? atoi(e) : 10;
@@ -3253,7 +3310,33 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 32;
         return v < 2 ? 2 : v;
     }();
-    int keep_ema8 = 0;   // EMA of keep, alpha = 1/8, held x8 so the decode path needs no float
+    // EMA of keep, alpha = 1/8. Held x64, not x8, and that factor is the whole point.
+    //
+    // AN INTEGER EMA HAS A DEAD BAND, AND THE SEED BELOW LANDED IN IT. The update was
+    // ema = ema - (ema >> 3) + keep, so ema is stationary whenever (ema >> 3) == keep, i.e. for
+    // EVERY ema in [8*keep, 8*keep+7] -- a band a full token wide. Held x8, the engage threshold
+    // (10 eighths) sits INSIDE the band for keep == 1: seed ema at 10, take keep == 1, and
+    // 10 - (10 >> 3) + 1 == 10 forever. The stream then never learns that acceptance is 1.0 and
+    // never hands itself back to the token loop, whatever the draft actually does.
+    //
+    // That is not hypothetical, it is the scored configuration. The seeding two screens down
+    // fires exactly when (start + B) >= kEngageMinSeq, so ctx=4096 starts pinned at 10 and stays
+    // there for the whole generation. The comment on kEngageKeepEighths reasons that "at ctx=512
+    // acceptance is 1.0, keep_ema8 settles at 8, and 8 < 10 leaves the stream on the token loop"
+    // -- true at 512 precisely BECAUSE 512 is below the floor and so is never seeded. Above the
+    // floor the same acceptance produced the opposite decision.
+    //
+    // Measured on RTX 5090 at ctx=4096 against the released DSpark draft, tau 1.0000 on both arms:
+    // the batched verify costs 12.771 ms/step against a 10.928 ms token-loop forward, so the gate
+    // armed the slower path on every one of 128 steps -- 68.09 tok/s where the token loop gives
+    // 77.90.
+    //
+    // x64 keeps alpha at 1/8 and shrinks the dead band from one token to an eighth of one:
+    // ema64 is stationary only on [64*keep - 7, 64*keep], so keep == 1 converges to 64 (= 1.0
+    // tokens, below the 80 the threshold now scales to) instead of parking on 80. Nothing about
+    // the POLICY moves -- same alpha, same threshold in eighths, same seeding, same floor. Only
+    // the resolution the policy is evaluated at.
+    int keep_ema64 = 0;
     int step_no = 0;
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
@@ -3299,7 +3382,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // Below kCompactMaxSeq this is byte-identical to main: same acceptance-run rule, same
         // batched MoE. The change is purely additive above that bound, which main never reached.
         const bool short_ctx = (start + B) <= kCompactMaxSeq;
-        // keep_ema8 ramps from zero at alpha = 1/8, so it needs 8-10 steps to reach the engage
+        // The EMA ramps from zero at alpha = 1/8, so it needs 8-10 steps to reach the engage
         // threshold even on a stream that clears it comfortably. Measured at 4k (tau 3.91, ema8
         // settles at ~31 against a threshold of 24): the batched path ran on 20 of 33 steps, and
         // the 13 it missed were the warmup, not a genuine low-acceptance stretch -- worth 6.3% of
@@ -3310,11 +3393,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // seeding is scoped to sequences past the floor: start armed there, and let the existing
         // decay hand the stream back to the token loop within a couple of steps if the draft turns
         // out not to be landing blocks. Below the floor the ramp is untouched.
-        if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepEighths;
+        if (step_no == 0 && (start + B) >= kEngageMinSeq)
+            keep_ema64 = kEngageKeepEighths * 8;
         const bool compact_verify = compact_mode == 1 ||
             (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
                                              : ((start + B) >= kEngageMinSeq &&
-                                                keep_ema8 >= kEngageKeepEighths)));
+                                                keep_ema64 >= kEngageKeepEighths * 8)));
         if (compact_verify) disarmed_run = 0; else ++disarmed_run;
         // Skip the draft only after kDraftProbeAfter consecutive disarmed steps, and let every
         // kDraftProbePeriod-th step through as a probe.
@@ -3480,7 +3564,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 fprintf(stderr, "%d ", (compact_verify || i <= accept) ? posterior[i] : -1);
             fprintf(stderr, "]\n");
         }
-        keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
+        // ema += (target - ema) / 8, with the target held in the same x64 domain. Written as a
+        // signed difference rather than main's decay-then-add so the step is driven by the error:
+        // the shift then rounds toward the target from both sides and the only stationary states
+        // are the eighth-token band around it, instead of a token-wide band the seed can sit in.
+        keep_ema64 += (keep * 64 - keep_ema64) >> 3;
         ++step_no;
         compact_score = keep == kProposalDepth + 1
                       ? std::min(compact_score + 1, kBlockScore + 1)
@@ -5056,6 +5144,22 @@ bool Qwen35Model::load_compressed_tensors(const std::string& model_dir) {
             w.ssm_conv = plain_bf16(lb + "conv1d.weight", (long)s.linear_qkvdim * c.linear_conv_kernel);
             w.ssm_alpha = plain_bf16(lb + "in_proj_a.weight", (long)c.linear_v_heads * H);
             w.ssm_beta = plain_bf16(lb + "in_proj_b.weight", (long)c.linear_v_heads * H);
+            // ...and once more as a single [2*v_heads, H] Linear, so decode issues one GEMV for
+            // the pair instead of two (see proj_ab in forward_token). Both are [out,in] row-major
+            // like every other HF Linear here, so "concatenate" is a straight byte append: rows
+            // 0..v_heads-1 are alpha, v_heads..2*v_heads-1 are beta, each row bit-for-bit the row
+            // the separate tensor holds. The originals are kept -- proj_ab falls back to them when
+            // the fuse is disabled, and this copy costs 2 x 330 KB per GDN layer (~31 MB total).
+            if (w.ssm_alpha && w.ssm_beta) {
+                const size_t half = (size_t)c.linear_v_heads * H * 2;   // bytes per tensor
+                void* ab = nullptr;
+                if (cudaMalloc(&ab, 2 * half) == cudaSuccess) {
+                    cudaMemcpy(ab, w.ssm_alpha, half, cudaMemcpyDeviceToDevice);
+                    cudaMemcpy((char*)ab + half, w.ssm_beta, half, cudaMemcpyDeviceToDevice);
+                    s.owned.push_back(ab);
+                    w.ssm_ab = ab;
+                }
+            }
             if (!w.wqkv || !w.wqkv_gate || !w.ssm_out || !w.ssm_dt || !w.ssm_a || !w.ssm_norm ||
                 !w.ssm_conv || !w.ssm_alpha || !w.ssm_beta) return false;
         } else {

@@ -68,6 +68,10 @@ struct Qwen35LayerWeights {
     const void* ssm_a = nullptr;          // [value_heads]
     const void* ssm_beta = nullptr;       // [hidden, value_heads]
     const void* ssm_alpha = nullptr;      // [hidden, value_heads]
+    // alpha and beta concatenated as one [2*value_heads, hidden] bf16 Linear, so the GDN block
+    // issues ONE tiny GEMV per layer instead of two. Null unless the checkpoint ships both as
+    // plain bf16 (the ModelOpt NVFP4 export does); the two separate pointers stay valid either way.
+    const void* ssm_ab = nullptr;         // [2*value_heads, hidden]
     const void* ssm_norm = nullptr;       // [linear_head_dim]
     const void* ssm_out = nullptr;        // [value_dim, hidden]
 
