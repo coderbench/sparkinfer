@@ -3150,9 +3150,30 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // than per step, because the verify graph dflash_warm_verify captures is sized from this and
     // a graph built for a row count the stream never uses costs more than the rows it saves --
     // measured, per-step narrowing under a 4-row warm graph recovers only 0.7% of the 9.4%.
+    // TWO proposals in the narrow band, and it only pays because of the dp4a verify GEMV in this
+    // same change. Measured on RTX 5090 at ctx=4096, both arms lossless:
+    //
+    //     verify GEMV   depth 1              depth 2              verdict
+    //     fp32 (main)   99.04 tok/s          96.05 tok/s          depth 2 LOSES by 3.0%
+    //     dp4a (here)   103.17 tok/s         106.20 tok/s         depth 2 WINS by 2.9%
+    //
+    // The extra proposal costs exactly one more verify row, and what changed is that row's price:
+    // 2.43 ms with the fp32 kernel, 1.42 ms with dp4a. Below that crossover the row cannot repay
+    // the acceptance it buys, which is why #878 measured depth 1 as optimal and why re-testing it
+    // on its own would measure the same thing again -- I did, and it came out -2.8%.
+    //
+    // Acceptance does rise with depth now: tau 1.5000 -> 1.7200 at depths 1 -> 2 on this box.
+    // #878's grid found it flat ("identical at depth 1, 2 and 3"), but that was taken through two
+    // defects since fixed -- #893's displaced Markov rows, which flattened precisely the deeper
+    // positions, and #894's causal block mask. The draft also already computes four block rows at
+    // depth 1 (#894 pins the width for the bidirectional context), so rows 2 and 3 are produced
+    // and discarded today; asking for one of them costs the draft 2.150 -> 2.378 ms.
+    //
+    // Depth 3 was measured too and is worse than 2 (tau 1.8169 but a third extra row): scope stays
+    // the narrow band, below kNarrowMinSeq keeps 3 and the >= kDeepMinSeq branch keeps 7.
     const int kProposalDepth = kProposalDepthEnv > 0 ? kProposalDepthEnv
                              : ((n + max_new) >= kDeepMinSeq ? 7
-                                : (n >= kNarrowMinSeq ? 1 : 3));
+                                : (n >= kNarrowMinSeq ? 2 : 3));
 
     // ...but "full block accepted" is a proxy, and a lossy one. What actually decides whether the
     // batched pass pays is how many sequential target forwards it collapses -- that is the MEAN

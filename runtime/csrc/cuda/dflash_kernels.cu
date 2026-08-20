@@ -310,6 +310,23 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
 // serial chain shortens and the grid grows with context. Per-split partial (m, l, acc)
 // states are merged by k_attn_split_combine, which is the same online-softmax merge the
 // in-CTA warp reduction already does -- exact for any split count.
+// One 64-bit load for the four contiguous bf16 a lane owns, instead of four 16-bit ones.
+//
+// D=128 with 32 lanes gives E=4, and lane L owns elements [4L, 4L+4) -- 8 contiguous bytes. The
+// warp's 32 lanes therefore cover 256 contiguous bytes and the access is already coalesced; what
+// it is not is CHEAP, because each element is its own load instruction and the q/k/v triple sits
+// in the innermost loop over the whole KV range. Four 16-bit loads become one 64-bit load.
+//
+// Bit-identical: b2f runs on the same four halves in the same order into the same registers.
+// The element offset is always a multiple of E=4, so the address is 8-byte aligned whenever the
+// cache base is, which cudaMalloc guarantees.
+__device__ __forceinline__ void df_load4_bf16(const bf16* __restrict__ p, float* __restrict__ out) {
+    const int2 packed = __ldg(reinterpret_cast<const int2*>(p));
+    const bf16* c = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+    for (int e = 0; e < 4; e++) out[e] = b2f(c[e]);
+}
+
 template <int ROWS, int NWARPS>
 __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -329,7 +346,12 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
         const int qt = qt0 + r;
         const bf16* qv = q + ((size_t)qt * n_q + qh) * D + base;
 #pragma unroll
-        for (int e = 0; e < E; e++) { qr[r][e] = (qt < q_len) ? b2f(qv[e]) : 0.f; acc[r][e] = 0.f; }
+        if (qt < q_len && E == 4) df_load4_bf16(qv, qr[r]);
+        else
+#pragma unroll
+            for (int e = 0; e < E; e++) qr[r][e] = (qt < q_len) ? b2f(qv[e]) : 0.f;
+#pragma unroll
+        for (int e = 0; e < E; e++) acc[r][e] = 0.f;
         max_s[r] = -1e30f;
         sum[r] = 0.f;
     }
@@ -345,8 +367,10 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
         const int k_pos = k_pos0 + t;
         const bf16* kp = k + ((size_t)t * n_kv + kv_h) * D + base;
         float kreg[E];
+        if (E == 4) df_load4_bf16(kp, kreg);
+        else
 #pragma unroll
-        for (int e = 0; e < E; e++) kreg[e] = b2f(kp[e]);
+            for (int e = 0; e < E; e++) kreg[e] = b2f(kp[e]);
         float dots[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -370,8 +394,10 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
             if (window > 0 && (q_pos - k_pos) >= window) continue;
             if (!vloaded) {
                 const bf16* vp = v + ((size_t)t * n_kv + kv_h) * D + base;
+                if (E == 4) df_load4_bf16(vp, vreg);
+                else
 #pragma unroll
-                for (int e = 0; e < E; e++) vreg[e] = b2f(vp[e]);
+                    for (int e = 0; e < E; e++) vreg[e] = b2f(vp[e]);
                 vloaded = true;
             }
             const float score = __shfl_sync(0xffffffffu, dots[r], 0) * scale;
@@ -1561,7 +1587,21 @@ __global__ void k_markov_bias_add(const bf16* __restrict__ w1, const bf16* __res
     if (v >= vocab) return;
     const bf16* w2_row = w2 + (size_t)v * rank;
     float acc = 0.f;
-    for (int r = 0; r < rank; r++) acc += latent[r] * b2f(w2_row[r]);
+    // Eight contiguous bf16 per load instead of one. This row is `rank` long and every thread
+    // walks its own, so the loop is 256 dependent 16-bit loads per vocab entry -- the kernel
+    // streams 127 MB of w2 per call at roughly half the bandwidth it should. Rows are rank*2
+    // bytes apart, so a 16-byte load stays aligned whenever rank is a multiple of 8; the scalar
+    // tail below covers any other rank. Bit-identical: same terms, same order, same running sum.
+    int r = 0;
+    if ((rank & 7) == 0 && ((reinterpret_cast<size_t>(w2_row) & 15u) == 0)) {
+        for (; r + 8 <= rank; r += 8) {
+            const int4 packed = __ldg(reinterpret_cast<const int4*>(w2_row + r));
+            const bf16* c = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc += latent[r + j] * b2f(c[j]);
+        }
+    }
+    for (; r < rank; r++) acc += latent[r] * b2f(w2_row[r]);
     logits[v] += acc;
 }
 

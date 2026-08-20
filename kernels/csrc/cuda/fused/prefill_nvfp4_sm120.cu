@@ -600,8 +600,23 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
     if (global_scale_dev) global_scale = *global_scale_dev;
     const float inv_gs = (ALU >= CT_ALU_RCP) ? (1.f / global_scale) : 0.f;
     const int ngroups = cols >> 4;
-    const int r = blockIdx.y;
-    if (r >= rows) return;
+    // GRID-STRIDE OVER ROWS. This was `const int r = blockIdx.y; if (r >= rows) return;`, which
+    // silently caps the kernel at 65535 rows -- CUDA's limit on gridDim.y. Every weight in the
+    // model clears that (the widest is the FFN gate/up at 17408) except ONE: lm_head, whose row
+    // count is the vocabulary. At V=248320 the launch is rejected with
+    // cudaErrorInvalidConfiguration, and because neither this launch nor the cudaStreamSynchronize
+    // after it is error-checked, the failure is silent -- the freshly cudaMalloc'd destination is
+    // simply never written, so the head dequantizes to all zeros.
+    //
+    // The symptom is a model that loads clean and produces uniform logits: every vocabulary entry
+    // scores identically, PPL comes out at exactly the vocab size, and argmax returns token 0 for
+    // any prompt. Everything upstream is healthy -- the final-norm output feeding the head measures
+    // l2=136.7 -- which is what makes it hard to see. It reaches DSpark as tau pinned at exactly
+    // 1.0000, i.e. a draft that never lands a proposal.
+    //
+    // Only the g16 fast path had this; the per-element fallback below already uses a 1-D grid over
+    // rows*cols, so SPARKINFER_CT_NVFP4_G16=0 was an accidental workaround.
+    for (int r = blockIdx.y; r < rows; r += gridDim.y) {
     const unsigned char* prow = packed + (size_t)r * (size_t)(cols >> 1);
     const unsigned char* srow = group_scale + (size_t)r * (size_t)ngroups;
     __nv_bfloat16* orow = out + (size_t)r * (size_t)cols;
@@ -624,6 +639,7 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
         }
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16)     = *reinterpret_cast<const uint4*>(o);
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16 + 8) = *reinterpret_cast<const uint4*>(o + 8);
+    }
     }
 }
 
@@ -752,7 +768,9 @@ static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_sca
         const int ngroups = cols >> 4;
         const int threads = 256;
         const int bx = (ngroups + threads - 1) / threads;
-        const dim3 grid(bx > 0 ? bx : 1, rows);
+        // gridDim.y maxes out at 65535; rows beyond that are covered by the kernel's row stride.
+        const int gy = rows > 65535 ? 65535 : rows;
+        const dim3 grid(bx > 0 ? bx : 1, gy);
         auto* pk = reinterpret_cast<const unsigned char*>(packed_u8);
         auto* gsc = reinterpret_cast<const unsigned char*>(group_scale_ue4m3);
         auto* ob = reinterpret_cast<__nv_bfloat16*>(out_bf16);
