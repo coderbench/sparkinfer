@@ -3172,7 +3172,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // hard bound that kept the batched verify away from long context entirely (the #712 gap); it
     // is now the boundary between "main's behaviour, unchanged" and "the new exact long-context
     // path", so nothing already validated at short context moves.
-    // Compared against keep_ema8 in the SCALED domain (kEngageKeep * 8), not by shifting the EMA
+    // Compared against the EMA in the SCALED domain (kEngageKeep * 8), not by shifting the EMA
     // down first. Shifting floors it, which collapses the very gap the gate exists to resolve:
     // 512-ctx sits at tau 2.19 (ema8 ~17.5) and 4k at tau 3.91 (ema8 ~31.3), and both floor to the
     // same value. Scaled, the threshold lands cleanly between them at 24.
@@ -3197,7 +3197,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 2;
         return v < 1 ? 1 : v;
     }();
-    // The engage threshold in EIGHTHS, which is the domain keep_ema8 already lives in, so it can
+    // The engage threshold in EIGHTHS, the domain the caller reasons about, so it can
     // express the number the trade actually turns on instead of rounding it to a whole token.
     //
     // One batched pass replaces `keep` sequential target forwards, so it pays exactly when
@@ -3209,10 +3209,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     //
     // 10/8 = 1.25, just above the measured 1.23, so the gate keeps a margin against the ratio
     // rather than sitting on it. It is self-limiting at short context, which is why this is not
-    // simply "always batch": at ctx=512 acceptance is 1.0, keep_ema8 settles at 8, and 8 < 10
-    // leaves the stream on the token loop exactly as today -- which matters, because the batched
-    // pass is measured 31% SLOWER there. SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS=16 restores main's
-    // whole-token threshold, so both arms of an A/B come out of one binary.
+    // simply "always batch": at ctx=512 acceptance is 1.0, the EMA settles at 1.0 tokens, which is
+    // below 1.25 and leaves the stream on the token loop -- which matters, because the batched
+    // pass is measured 31% SLOWER there. Since the EMA is held x64 it now settles there at ctx=4k
+    // too, where main's x8 form was pinned on the threshold by its own seed.
+    // SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS=16 restores main's whole-token threshold, so both arms
+    // of an A/B come out of one binary.
     static const int kEngageKeepEighths = []{
         const char* e = getenv("SPARKINFER_DFLASH_ENGAGE_KEEP_EIGHTHS");
         int v = e ? atoi(e) : 10;
@@ -3253,7 +3255,33 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         int v = e ? atoi(e) : 32;
         return v < 2 ? 2 : v;
     }();
-    int keep_ema8 = 0;   // EMA of keep, alpha = 1/8, held x8 so the decode path needs no float
+    // EMA of keep, alpha = 1/8. Held x64, not x8, and that factor is the whole point.
+    //
+    // AN INTEGER EMA HAS A DEAD BAND, AND THE SEED BELOW LANDED IN IT. The update was
+    // ema = ema - (ema >> 3) + keep, so ema is stationary whenever (ema >> 3) == keep, i.e. for
+    // EVERY ema in [8*keep, 8*keep+7] -- a band a full token wide. Held x8, the engage threshold
+    // (10 eighths) sits INSIDE the band for keep == 1: seed ema at 10, take keep == 1, and
+    // 10 - (10 >> 3) + 1 == 10 forever. The stream then never learns that acceptance is 1.0 and
+    // never hands itself back to the token loop, whatever the draft actually does.
+    //
+    // That is not hypothetical, it is the scored configuration. The seeding two screens down
+    // fires exactly when (start + B) >= kEngageMinSeq, so ctx=4096 starts pinned at 10 and stays
+    // there for the whole generation. The comment on kEngageKeepEighths reasons that "at ctx=512
+    // acceptance is 1.0, keep_ema8 settles at 8, and 8 < 10 leaves the stream on the token loop"
+    // -- true at 512 precisely BECAUSE 512 is below the floor and so is never seeded. Above the
+    // floor the same acceptance produced the opposite decision.
+    //
+    // Measured on RTX 5090 at ctx=4096 against the released DSpark draft, tau 1.0000 on both arms:
+    // the batched verify costs 12.771 ms/step against a 10.928 ms token-loop forward, so the gate
+    // armed the slower path on every one of 128 steps -- 68.09 tok/s where the token loop gives
+    // 77.90.
+    //
+    // x64 keeps alpha at 1/8 and shrinks the dead band from one token to an eighth of one:
+    // ema64 is stationary only on [64*keep - 7, 64*keep], so keep == 1 converges to 64 (= 1.0
+    // tokens, below the 80 the threshold now scales to) instead of parking on 80. Nothing about
+    // the POLICY moves -- same alpha, same threshold in eighths, same seeding, same floor. Only
+    // the resolution the policy is evaluated at.
+    int keep_ema64 = 0;
     int step_no = 0;
     bf16* th_scratch = nullptr;
     const int row_stride = dflash_hidden_row_stride();
@@ -3299,7 +3327,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // Below kCompactMaxSeq this is byte-identical to main: same acceptance-run rule, same
         // batched MoE. The change is purely additive above that bound, which main never reached.
         const bool short_ctx = (start + B) <= kCompactMaxSeq;
-        // keep_ema8 ramps from zero at alpha = 1/8, so it needs 8-10 steps to reach the engage
+        // The EMA ramps from zero at alpha = 1/8, so it needs 8-10 steps to reach the engage
         // threshold even on a stream that clears it comfortably. Measured at 4k (tau 3.91, ema8
         // settles at ~31 against a threshold of 24): the batched path ran on 20 of 33 steps, and
         // the 13 it missed were the warmup, not a genuine low-acceptance stretch -- worth 6.3% of
@@ -3310,11 +3338,12 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // seeding is scoped to sequences past the floor: start armed there, and let the existing
         // decay hand the stream back to the token loop within a couple of steps if the draft turns
         // out not to be landing blocks. Below the floor the ramp is untouched.
-        if (step_no == 0 && (start + B) >= kEngageMinSeq) keep_ema8 = kEngageKeepEighths;
+        if (step_no == 0 && (start + B) >= kEngageMinSeq)
+            keep_ema64 = kEngageKeepEighths * 8;
         const bool compact_verify = compact_mode == 1 ||
             (compact_mode != 0 && (short_ctx ? compact_score >= kBlockScore
                                              : ((start + B) >= kEngageMinSeq &&
-                                                keep_ema8 >= kEngageKeepEighths)));
+                                                keep_ema64 >= kEngageKeepEighths * 8)));
         if (compact_verify) disarmed_run = 0; else ++disarmed_run;
         // Skip the draft only after kDraftProbeAfter consecutive disarmed steps, and let every
         // kDraftProbePeriod-th step through as a probe.
@@ -3480,7 +3509,11 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 fprintf(stderr, "%d ", (compact_verify || i <= accept) ? posterior[i] : -1);
             fprintf(stderr, "]\n");
         }
-        keep_ema8 = keep_ema8 - (keep_ema8 >> 3) + keep;
+        // ema += (target - ema) / 8, with the target held in the same x64 domain. Written as a
+        // signed difference rather than main's decay-then-add so the step is driven by the error:
+        // the shift then rounds toward the target from both sides and the only stationary states
+        // are the eighth-token band around it, instead of a token-wide band the seed can sit in.
+        keep_ema64 += (keep * 64 - keep_ema64) >> 3;
         ++step_no;
         compact_score = keep == kProposalDepth + 1
                       ? std::min(compact_score + 1, kBlockScore + 1)

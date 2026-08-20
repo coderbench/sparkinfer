@@ -15,6 +15,7 @@
 #endif
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include <cuda_runtime.h>
+#include <cstdint>
 #endif
 
 namespace sparkinfer {
@@ -749,6 +750,45 @@ __device__ __forceinline__ void si_nvfp4_load_x16(const __nv_bfloat16* x16, floa
     }
 }
 
+// Same 16 activations, same conversions, same destination lanes -- fetched as two 128-bit loads
+// instead of eight 32-bit ones.
+//
+// A group is 16 bf16 = 32 contiguous bytes, but nothing in the scalar form above tells the
+// compiler that: the address is x + r*K + g*16 with K and g both runtime values, so it cannot
+// prove 16-byte alignment and emits eight 32-bit loads. On this kernel that is the dominant
+// instruction stream -- the activations are re-read for every output row a warp owns, which is
+// what the 3.41 GB L1 against 29.5 MB DRAM ratio recorded below is made of -- so what the x side
+// costs is the load COUNT, not the byte count. Two 128-bit loads carry the same 32 bytes in a
+// quarter of the issue slots.
+//
+// Alignment is a precondition, not an assumption: launch_gemv_nvfp4_rows checks the base pointer
+// once and selects an XVEC instantiation only when it holds. Every row starts at x + r*K and K is
+// a multiple of 16 (the launcher rejects anything else), so a 16-byte-aligned base leaves every
+// row and every group 16-byte aligned too.
+//
+// Bit-identical: __bfloat1622float2 runs over the same halves in the same order and writes the
+// same lanes of xv, so si_nvfp4_dot16 folds an identical term sequence. Only the load width moves.
+__device__ __forceinline__ void si_nvfp4_load_x16_vec(const __nv_bfloat16* x16,
+                                                      float* __restrict__ xv) {
+    int4 v[2];
+    v[0] = __ldg(reinterpret_cast<const int4*>(x16));
+    v[1] = __ldg(reinterpret_cast<const int4*>(x16) + 1);
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(v);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const float2 xf = __bfloat1622float2(x2[i]);
+        xv[2 * i] = xf.x;
+        xv[2 * i + 1] = xf.y;
+    }
+}
+
+template <bool XVEC>
+__device__ __forceinline__ void si_nvfp4_load_x16_sel(const __nv_bfloat16* x16,
+                                                      float* __restrict__ xv) {
+    if (XVEC) si_nvfp4_load_x16_vec(x16, xv);
+    else      si_nvfp4_load_x16(x16, xv);
+}
+
 __device__ __forceinline__ float si_nvfp4_dot16(const float* __restrict__ ws,
                                                 const float* __restrict__ xv) {
     float acc = 0.f;
@@ -811,7 +851,7 @@ template __global__ void gemv_nvfp4_sk_kernel<__nv_bfloat16, 8>(const __nv_bfloa
 // stride), accumulates into its own float, and folds its splits in the same ascending order. Only
 // the weight and scale loads are shared between rows -- the arithmetic per row is untouched, which
 // is what keeps the speculative path lossless by construction rather than by measurement.
-template <typename OutT, int S, int R, int NR>
+template <typename OutT, int S, int R, int NR, bool XVEC>
 __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                           const void* __restrict__ packed,
                                           OutT* __restrict__ y, int N, int K) {
@@ -830,6 +870,9 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
     //
     // Bit-identical: each (n, r) dot still walks the same groups in the same order and folds the
     // same S partials. Only which warp owns which output row changes. NR=1 is the original.
+    //
+    // XVEC selects 128-bit activation loads (si_nvfp4_load_x16_vec). It is orthogonal to NR: NR
+    // decides how OFTEN x is re-read, XVEC how many instructions each read costs.
     const int n0 = blockIdx.x * (RPB * NR) + row_local * NR;
     float acc[NR][R];
     #pragma unroll
@@ -846,7 +889,7 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
             float xv[R][16];
             #pragma unroll
             for (int r = 0; r < R; r++)
-                si_nvfp4_load_x16(x + (size_t)r * K + (size_t)g * 16, xv[r]);
+                si_nvfp4_load_x16_sel<XVEC>(x + (size_t)r * K + (size_t)g * 16, xv[r]);
             #pragma unroll
             for (int j = 0; j < NR; j++) {
                 const int nj = n0 + j;
@@ -892,8 +935,9 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
 }
 #ifndef _MSC_VER
 #define SI_NVFP4_ROWS_INST(S_, R_) \
-template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
-template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 1, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2, false>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int); \
+template __global__ void gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S_, R_, 2, true>(const __nv_bfloat16*, const void*, __nv_bfloat16*, int, int);
 SI_NVFP4_ROWS_INST(2, 2) SI_NVFP4_ROWS_INST(4, 2) SI_NVFP4_ROWS_INST(8, 2)
 SI_NVFP4_ROWS_INST(2, 4) SI_NVFP4_ROWS_INST(4, 4) SI_NVFP4_ROWS_INST(8, 4)
 SI_NVFP4_ROWS_INST(2, 6) SI_NVFP4_ROWS_INST(4, 6) SI_NVFP4_ROWS_INST(8, 6)
@@ -2532,16 +2576,34 @@ bool launch_gemv_nvfp4_rows(const void* x, const void* W, void* y, int M, int N,
     if (M < 2 || M > 8) return false;
     const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x);
     auto* yp = reinterpret_cast<__nv_bfloat16*>(y);
-    // SPARKINFER_NVFP4_ROWS_NR=1 gives one output row per warp, i.e. main's kernel exactly, so both
-    // arms of an A/B come out of one binary.
+    // 128-bit activation loads, when the caller's buffer allows them. K is already known to be a
+    // multiple of 16 (rejected above otherwise), so every row base x + r*K sits a whole number of
+    // 32-byte groups from the base -- one check on the base therefore covers every row and every
+    // group. A caller that hands over an odd offset simply gets the scalar loads it gets today.
+    // SPARKINFER_NVFP4_ROWS_XVEC=0 forces the scalar loads back on, so "main's kernel" is one env
+    // away in the same binary rather than a second build.
+    static const bool xvec_off = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_XVEC");
+                                     return e && e[0] == '0'; }();
+    const bool xvec = !xvec_off && ((reinterpret_cast<uintptr_t>(xp) & 15u) == 0);
+    // SPARKINFER_NVFP4_ROWS_NR=1 gives one output row per warp, i.e. main's pre-#891 kernel, so
+    // both arms of an A/B come out of one binary.
+    //
+    // A WIDER TIER WAS TRIED AND IS NOT HERE. NR=4 removes half of the activation traffic NR=2
+    // leaves behind, so it should have been the obvious next step -- measured, it is slower:
+    // 69.30 tok/s against 69.97 for NR=2 at the scored context, batched verify 12.517 ms against
+    // 12.378. xv[R][16] is R*16 floats live across the whole group loop whatever NR is, and
+    // widening the accumulator on top of that spills the very registers the tier exists to keep
+    // resident. The activation traffic is real but it is not what this kernel is short of.
     static const int nr = []{ const char* e = getenv("SPARKINFER_NVFP4_ROWS_NR");
                               return (e && e[0] == '1') ? 1 : 2; }();
 #define SI_NVFP4_ROWS(S_, R_) do { \
         constexpr int S = (S_), R = (R_), RPB = GEMV_WPB / S; \
-        if (nr == 2) { const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
-            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
+        if (nr == 2 && xvec) { const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
+            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2, true><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
+        else if (nr == 2) { const dim3 grid((N + RPB * 2 - 1) / (RPB * 2)); \
+            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 2, false><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
         else { const dim3 grid((N + RPB - 1) / RPB); \
-            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 1><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
+            gemv_nvfp4_rows_sk_kernel<__nv_bfloat16, S, R, 1, false><<<grid, GEMV_WPB * 32, 0, stream>>>(xp, W, yp, N, K); } \
     } while (0)
 #define SI_NVFP4_ROWS_S(R_) do { \
         if (N >= 8192)      SI_NVFP4_ROWS(2, R_); \
