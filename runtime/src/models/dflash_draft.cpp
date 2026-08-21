@@ -1051,9 +1051,27 @@ bool DFlashDraftModel::forward_block(const void* target_hidden, int ctx_len,
     cu(cudaMemcpyAsync(s.x, s.noise, (size_t)BW * H * sizeof(bf16), cudaMemcpyDeviceToDevice, st),
        "noise->x");
 
+    // FOUR OF THE DRAFT'S FIVE LAYERS, at the scored context.
+    //
+    // The draft's cost and its acceptance are not equally elastic, and the balance point is not
+    // where it was when this defaulted to the full stack. Measured on RTX 5090 at ctx=4096 against
+    // the released DSpark draft, all arms lossless:
+    //
+    //     layers   draft ms   tau      dspark tok/s
+    //       5        2.201    1.5000     98.91      <- previous default
+    //       4        1.967    1.4884    100.34      <- +1.4%, tau -0.8%
+    //       3        1.718    1.3763     94.33
+    //       2        1.483    1.3196     91.91
+    //
+    // Below four the curve turns over hard: layer three costs 8% of acceptance to buy 22% of the
+    // draft, which is a net loss. Four is the one point where the trade is positive, and it stays
+    // comfortably inside the acceptance floor (0.992x, bar 0.95x). Context trimming was measured on
+    // the same grid and loses at this length -- windowing the full-attention layer to 1024 or 512
+    // takes tau to 1.4066 / 1.4176 for 0.32 ms, both net negative -- so the window keeps its
+    // existing 3x-sliding default and only the depth moves.
     static const int active_layers = [] {
         const char* e = getenv("SPARKINFER_DFLASH_LAYERS");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : 4;
     }();
     const int run_layers = active_layers > 0 ? std::min(active_layers, c.n_layers) : c.n_layers;
     // cat(k_ctx, k_noise) is built at exactly the layout and length the cache slice expects, so

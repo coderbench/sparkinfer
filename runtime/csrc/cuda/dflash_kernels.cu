@@ -310,6 +310,24 @@ __global__ void k_attn(const bf16* q, const bf16* k, const bf16* v, bf16* out,
 // serial chain shortens and the grid grows with context. Per-split partial (m, l, acc)
 // states are merged by k_attn_split_combine, which is the same online-softmax merge the
 // in-CTA warp reduction already does -- exact for any split count.
+// Widened bf16 loads for the draft's own kernels.
+//
+// The verify GEMV had this treatment (#891, #899) and it is worth ~2% there; the DRAFT's kernels
+// never did, and they carry 1.18 ms of the 14.75 ms decode step. Each of the loops below fetches
+// contiguous bf16 one element at a time, so a lane issues four or eight separate 16-bit loads
+// where one 64- or 128-bit load carries the same bytes.
+//
+// Bit-identical: b2f runs on the same halves in the same order into the same registers -- only the
+// load width moves. Alignment is structural, not assumed: every offset below is a whole multiple
+// of the vector width in elements (E=4 for the hd128 attention lanes, 8 for the Markov rows), so a
+// cudaMalloc'd base keeps every access aligned.
+__device__ __forceinline__ void df_ld4_bf16(const bf16* __restrict__ p, float* __restrict__ out) {
+    const int2 v = __ldg(reinterpret_cast<const int2*>(p));
+    const bf16* c = reinterpret_cast<const bf16*>(&v);
+#pragma unroll
+    for (int e = 0; e < 4; e++) out[e] = b2f(c[e]);
+}
+
 template <int ROWS, int NWARPS>
 __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -329,7 +347,12 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
         const int qt = qt0 + r;
         const bf16* qv = q + ((size_t)qt * n_q + qh) * D + base;
 #pragma unroll
-        for (int e = 0; e < E; e++) { qr[r][e] = (qt < q_len) ? b2f(qv[e]) : 0.f; acc[r][e] = 0.f; }
+        if (qt < q_len && E == 4) df_ld4_bf16(qv, qr[r]);
+        else
+#pragma unroll
+            for (int e = 0; e < E; e++) qr[r][e] = (qt < q_len) ? b2f(qv[e]) : 0.f;
+#pragma unroll
+        for (int e = 0; e < E; e++) acc[r][e] = 0.f;
         max_s[r] = -1e30f;
         sum[r] = 0.f;
     }
@@ -346,7 +369,10 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
         const bf16* kp = k + ((size_t)t * n_kv + kv_h) * D + base;
         float kreg[E];
 #pragma unroll
-        for (int e = 0; e < E; e++) kreg[e] = b2f(kp[e]);
+        if (E == 4) df_ld4_bf16(kp, kreg);
+        else
+#pragma unroll
+            for (int e = 0; e < E; e++) kreg[e] = b2f(kp[e]);
         float dots[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -371,7 +397,10 @@ __global__ __launch_bounds__(NWARPS * 32) void k_attn_rows_split_hd128(
             if (!vloaded) {
                 const bf16* vp = v + ((size_t)t * n_kv + kv_h) * D + base;
 #pragma unroll
-                for (int e = 0; e < E; e++) vreg[e] = b2f(vp[e]);
+                if (E == 4) df_ld4_bf16(vp, vreg);
+                else
+#pragma unroll
+                    for (int e = 0; e < E; e++) vreg[e] = b2f(vp[e]);
                 vloaded = true;
             }
             const float score = __shfl_sync(0xffffffffu, dots[r], 0) * scale;
@@ -1561,7 +1590,20 @@ __global__ void k_markov_bias_add(const bf16* __restrict__ w1, const bf16* __res
     if (v >= vocab) return;
     const bf16* w2_row = w2 + (size_t)v * rank;
     float acc = 0.f;
-    for (int r = 0; r < rank; r++) acc += latent[r] * b2f(w2_row[r]);
+    // Eight contiguous bf16 per load instead of one. Every thread walks its own `rank`-long row,
+    // so this loop is `rank` dependent 16-bit loads per vocabulary entry and the kernel streams
+    // 127 MB of w2 per call. Rows are rank*2 bytes apart, so a 16-byte load stays aligned whenever
+    // rank is a multiple of 8; the scalar tail covers any other rank.
+    int r = 0;
+    if ((rank & 7) == 0 && ((reinterpret_cast<size_t>(w2_row) & 15u) == 0)) {
+        for (; r + 8 <= rank; r += 8) {
+            const int4 v = __ldg(reinterpret_cast<const int4*>(w2_row + r));
+            const bf16* c = reinterpret_cast<const bf16*>(&v);
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc += latent[r + j] * b2f(c[j]);
+        }
+    }
+    for (; r < rank; r++) acc += latent[r] * b2f(w2_row[r]);
     logits[v] += acc;
 }
 

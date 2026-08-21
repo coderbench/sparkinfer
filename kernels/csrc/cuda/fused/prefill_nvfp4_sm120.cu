@@ -600,8 +600,9 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
     if (global_scale_dev) global_scale = *global_scale_dev;
     const float inv_gs = (ALU >= CT_ALU_RCP) ? (1.f / global_scale) : 0.f;
     const int ngroups = cols >> 4;
-    const int r = blockIdx.y;
-    if (r >= rows) return;
+    // Grid-stride over rows: gridDim.y is capped at 65535, and lm_head has `vocab` rows (248320
+    // on this checkpoint), so the launch is silently rejected and the head dequantizes to zeros.
+    for (int r = blockIdx.y; r < rows; r += gridDim.y) {
     const unsigned char* prow = packed + (size_t)r * (size_t)(cols >> 1);
     const unsigned char* srow = group_scale + (size_t)r * (size_t)ngroups;
     __nv_bfloat16* orow = out + (size_t)r * (size_t)cols;
@@ -624,6 +625,7 @@ __global__ void ct_dequant_nvfp4_g16_kernel(const unsigned char* __restrict__ pa
         }
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16)     = *reinterpret_cast<const uint4*>(o);
         *reinterpret_cast<uint4*>(orow + (size_t)g * 16 + 8) = *reinterpret_cast<const uint4*>(o + 8);
+    }
     }
 }
 
@@ -752,7 +754,7 @@ static void ct_dequant_nvfp4_launch(const void* packed_u8, const void* group_sca
         const int ngroups = cols >> 4;
         const int threads = 256;
         const int bx = (ngroups + threads - 1) / threads;
-        const dim3 grid(bx > 0 ? bx : 1, rows);
+        const dim3 grid(bx > 0 ? bx : 1, rows > 65535 ? 65535 : rows);
         auto* pk = reinterpret_cast<const unsigned char*>(packed_u8);
         auto* gsc = reinterpret_cast<const unsigned char*>(group_scale_ue4m3);
         auto* ob = reinterpret_cast<__nv_bfloat16*>(out_bf16);
